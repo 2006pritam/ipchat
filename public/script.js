@@ -12,6 +12,7 @@ let myUsername = "";
 let myRoom = "";
 let cryptoKey = null;
 let replyingTo = null;
+let currentMembers = [];
 
 // Voice recording state
 let mediaRecorder = null;
@@ -21,6 +22,27 @@ let recordingStartTime = 0;
 let isRecording = false;
 let audioStream = null;
 let currentlyPlayingAudio = null;
+
+// ── WebRTC Video Call State ──
+const rtcConfig = {
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+    { urls: "stun:stun2.l.google.com:19302" },
+    { urls: "stun:stun.services.mozilla.com" }
+  ]
+};
+let peerConnection = null;
+let localVideoStream = null;
+let screenStream = null;
+let currentCallPeer = null;
+let pendingCall = null;
+let callTimerInterval = null;
+let callStartTime = 0;
+let isMicMuted = false;
+let isCamOff = false;
+let isScreenSharing = false;
+let iceCandidatesQueue = [];
 
 // ── DOM references ──
 const joinScreen          = document.getElementById("join-screen");
@@ -58,6 +80,25 @@ const overlayImg          = document.getElementById("overlay-img");
 const overlayCloseBtn     = document.getElementById("overlay-close-btn");
 const overlayDownloadBtn  = document.getElementById("overlay-download-btn");
 
+// Video Call DOM references
+const videoCallBtn        = document.getElementById("video-call-btn");
+const incomingCallModal   = document.getElementById("incoming-call-modal");
+const incomingCallerName  = document.getElementById("incoming-caller-name");
+const acceptCallBtn       = document.getElementById("accept-call-btn");
+const rejectCallBtn       = document.getElementById("reject-call-btn");
+const videoCallModal      = document.getElementById("video-call-modal");
+const localVideo          = document.getElementById("local-video");
+const remoteVideo         = document.getElementById("remote-video");
+const callPeerNameEl      = document.getElementById("call-peer-name");
+const callDurationEl      = document.getElementById("call-duration");
+const callStatusBadge     = document.getElementById("call-status-badge");
+const toggleMicBtn        = document.getElementById("toggle-mic-btn");
+const toggleCamBtn        = document.getElementById("toggle-cam-btn");
+const toggleScreenBtn     = document.getElementById("toggle-screen-btn");
+const endCallBtn          = document.getElementById("end-call-btn");
+const remotePlaceholder   = document.getElementById("remote-avatar-placeholder");
+const placeholderPeerName = document.getElementById("placeholder-peer-name");
+
 // ── Connection status ──
 socket.on("connect", () => { console.log("✅ Connected:", socket.id); });
 socket.on("connect_error", (err) => { console.error("❌ Error:", err.message); });
@@ -88,11 +129,11 @@ async function wakeServer() {
 joinBtn.disabled = true;
 wakeServer();
 
-// ── Chunked Uint8Array <-> Base64 conversion (avoids call stack overflow and freeze) ──
+// ── Fast Chunked Uint8Array <-> Base64 conversion ──
 function uint8ToBase64(uint8) {
   let binary = "";
   const len = uint8.byteLength;
-  const CHUNK_SIZE = 0x8000; // 32KB chunks
+  const CHUNK_SIZE = 0x8000;
   for (let i = 0; i < len; i += CHUNK_SIZE) {
     binary += String.fromCharCode.apply(null, uint8.subarray(i, Math.min(i + CHUNK_SIZE, len)));
   }
@@ -155,12 +196,18 @@ function blobToDataURL(blob) {
   });
 }
 
-// ── Format audio seconds helper ──
+// ── Format audio/call seconds helper ──
 function formatAudioTime(seconds) {
   const s = Math.floor(seconds || 0);
   const mins = Math.floor(s / 60);
   const secs = s % 60;
   return `${mins}:${secs < 10 ? "0" : ""}${secs}`;
+}
+
+function formatCallTimer(seconds) {
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  return `${mins < 10 ? "0" : ""}${mins}:${secs < 10 ? "0" : ""}${secs}`;
 }
 
 // ── Validate IP ──
@@ -208,17 +255,27 @@ ipInput.addEventListener("keydown", (e) => { if (e.key === "Enter") joinRoom(); 
 
 // ── MEMBERS LIST ──
 socket.on("members_update", ({ members }) => {
-  userCount.textContent = members.length;
+  currentMembers = members || [];
+  userCount.textContent = currentMembers.length;
   membersList.innerHTML = "";
-  members.forEach(({ id, username }) => {
+  currentMembers.forEach(({ id, username }) => {
     const isMe = id === socket.id;
     const item = document.createElement("div");
     item.className = `member-item${isMe ? " member-me" : ""}`;
     item.innerHTML = `
       <span class="member-dot"></span>
       <span class="member-name">${escapeHtml(username)}</span>
-      ${isMe ? '<span class="member-you-tag">you</span>' : ""}
+      ${isMe ? '<span class="member-you-tag">you</span>' : `<button class="member-call-btn" title="Call ${escapeHtml(username)}" data-id="${id}" data-name="${escapeHtml(username)}">📹</button>`}
     `;
+    if (!isMe) {
+      const callBtn = item.querySelector(".member-call-btn");
+      if (callBtn) {
+        callBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          startCallWithPeer(id, username);
+        });
+      }
+    }
     membersList.appendChild(item);
   });
 });
@@ -547,6 +604,298 @@ function stopVoiceRecording(shouldSend) {
     recordingBar.classList.remove("active");
     chatInputBar.style.display = "flex";
   }
+}
+
+// ── WEBRTC VIDEO CALLING SYSTEM ──
+videoCallBtn.addEventListener("click", () => {
+  const otherMembers = currentMembers.filter(m => m.id !== socket.id);
+  if (otherMembers.length === 0) {
+    alert("No one else is currently in this room to call. Share this IP address with a friend!");
+    return;
+  }
+  // Call the other member in 1-on-1, or prompt if multiple
+  const target = otherMembers[0];
+  startCallWithPeer(target.id, target.username);
+});
+
+async function startCallWithPeer(targetId, targetUsername) {
+  if (peerConnection) {
+    alert("You are already in an active call.");
+    return;
+  }
+
+  currentCallPeer = { id: targetId, username: targetUsername };
+  callPeerNameEl.textContent = targetUsername;
+  placeholderPeerName.textContent = targetUsername;
+  callStatusBadge.textContent = "Calling...";
+  callDurationEl.textContent = "00:00";
+  videoCallModal.style.display = "flex";
+
+  try {
+    localVideoStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    localVideo.srcObject = localVideoStream;
+  } catch (err) {
+    console.error("Camera/Mic error:", err);
+    try {
+      localVideoStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      localVideo.srcObject = null;
+    } catch (e2) {
+      alert("Could not access camera or microphone.");
+      cleanupVideoCall();
+      return;
+    }
+  }
+
+  createPeerConnection();
+  localVideoStream.getTracks().forEach(track => peerConnection.addTrack(track, localVideoStream));
+
+  try {
+    const offer = await peerConnection.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+    await peerConnection.setLocalDescription(offer);
+    socket.emit("call_user", { to: targetId, offer });
+  } catch (err) {
+    console.error("Error creating call offer:", err);
+    cleanupVideoCall();
+  }
+}
+
+function createPeerConnection() {
+  peerConnection = new RTCPeerConnection(rtcConfig);
+  iceCandidatesQueue = [];
+
+  peerConnection.ontrack = (event) => {
+    if (event.streams && event.streams[0]) {
+      remoteVideo.srcObject = event.streams[0];
+      remotePlaceholder.style.display = "none";
+      remoteVideo.style.display = "block";
+    }
+  };
+
+  peerConnection.onicecandidate = (event) => {
+    if (event.candidate && currentCallPeer) {
+      socket.emit("ice_candidate", { to: currentCallPeer.id, candidate: event.candidate });
+    }
+  };
+
+  peerConnection.onconnectionstatechange = () => {
+    if (!peerConnection) return;
+    const state = peerConnection.connectionState;
+    if (state === "connected") {
+      callStatusBadge.textContent = "Connected";
+      startCallTimer();
+    } else if (state === "disconnected" || state === "failed" || state === "closed") {
+      callStatusBadge.textContent = "Disconnected";
+    }
+  };
+}
+
+function startCallTimer() {
+  if (callTimerInterval) clearInterval(callTimerInterval);
+  callStartTime = Date.now();
+  callTimerInterval = setInterval(() => {
+    const elapsed = Math.floor((Date.now() - callStartTime) / 1000);
+    callDurationEl.textContent = formatCallTimer(elapsed);
+  }, 1000);
+}
+
+// ── WebRTC Socket Events ──
+socket.on("incoming_call", ({ from, username, offer }) => {
+  if (peerConnection) {
+    socket.emit("reject_call", { to: from });
+    return;
+  }
+  pendingCall = { from, username, offer };
+  incomingCallerName.textContent = username;
+  incomingCallModal.style.display = "flex";
+});
+
+acceptCallBtn.addEventListener("click", async () => {
+  if (!pendingCall) return;
+  const { from, username, offer } = pendingCall;
+  incomingCallModal.style.display = "none";
+
+  currentCallPeer = { id: from, username };
+  callPeerNameEl.textContent = username;
+  placeholderPeerName.textContent = username;
+  callStatusBadge.textContent = "Connecting...";
+  callDurationEl.textContent = "00:00";
+  videoCallModal.style.display = "flex";
+
+  try {
+    localVideoStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    localVideo.srcObject = localVideoStream;
+  } catch (err) {
+    try {
+      localVideoStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      localVideo.srcObject = null;
+    } catch (e2) {
+      alert("Could not access camera or microphone.");
+      socket.emit("reject_call", { to: from });
+      cleanupVideoCall();
+      return;
+    }
+  }
+
+  createPeerConnection();
+  localVideoStream.getTracks().forEach(track => peerConnection.addTrack(track, localVideoStream));
+
+  try {
+    await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+    while (iceCandidatesQueue.length > 0) {
+      const cand = iceCandidatesQueue.shift();
+      await peerConnection.addIceCandidate(new RTCIceCandidate(cand));
+    }
+    const answer = await peerConnection.createAnswer();
+    await peerConnection.setLocalDescription(answer);
+    socket.emit("answer_call", { to: from, answer });
+    startCallTimer();
+  } catch (err) {
+    console.error("Error answering call:", err);
+    cleanupVideoCall();
+  }
+});
+
+rejectCallBtn.addEventListener("click", () => {
+  if (pendingCall) {
+    socket.emit("reject_call", { to: pendingCall.from });
+    pendingCall = null;
+  }
+  incomingCallModal.style.display = "none";
+});
+
+socket.on("call_answered", async ({ answer }) => {
+  if (peerConnection) {
+    try {
+      await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+      callStatusBadge.textContent = "Connected";
+      startCallTimer();
+      while (iceCandidatesQueue.length > 0) {
+        const cand = iceCandidatesQueue.shift();
+        await peerConnection.addIceCandidate(new RTCIceCandidate(cand));
+      }
+    } catch (e) {
+      console.error("Error setting remote description on answered:", e);
+    }
+  }
+});
+
+socket.on("ice_candidate", async ({ candidate }) => {
+  if (peerConnection && peerConnection.remoteDescription) {
+    try {
+      await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+    } catch (e) {
+      console.error("Error adding ice candidate:", e);
+    }
+  } else {
+    iceCandidatesQueue.push(candidate);
+  }
+});
+
+socket.on("call_rejected", ({ username }) => {
+  alert(`${username || "User"} declined the video call.`);
+  cleanupVideoCall();
+});
+
+socket.on("call_ended", () => {
+  if (peerConnection || videoCallModal.style.display === "flex") {
+    appendSystemMessage("Video call ended");
+    cleanupVideoCall();
+  }
+});
+
+// In-Call Toolbar Controls
+toggleMicBtn.addEventListener("click", () => {
+  if (!localVideoStream) return;
+  isMicMuted = !isMicMuted;
+  localVideoStream.getAudioTracks().forEach(track => track.enabled = !isMicMuted);
+  toggleMicBtn.classList.toggle("off", isMicMuted);
+  toggleMicBtn.querySelector(".icon-mic-on").style.display = isMicMuted ? "none" : "block";
+  toggleMicBtn.querySelector(".icon-mic-off").style.display = isMicMuted ? "block" : "none";
+});
+
+toggleCamBtn.addEventListener("click", () => {
+  if (!localVideoStream) return;
+  isCamOff = !isCamOff;
+  localVideoStream.getVideoTracks().forEach(track => track.enabled = !isCamOff);
+  toggleCamBtn.classList.toggle("off", isCamOff);
+  toggleCamBtn.querySelector(".icon-cam-on").style.display = isCamOff ? "none" : "block";
+  toggleCamBtn.querySelector(".icon-cam-off").style.display = isCamOff ? "block" : "none";
+});
+
+toggleScreenBtn.addEventListener("click", async () => {
+  if (!peerConnection) return;
+  if (!isScreenSharing) {
+    try {
+      screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+      const screenTrack = screenStream.getVideoTracks()[0];
+      const sender = peerConnection.getSenders().find(s => s.track && s.track.kind === "video");
+      if (sender) sender.replaceTrack(screenTrack);
+      localVideo.srcObject = screenStream;
+      isScreenSharing = true;
+      toggleScreenBtn.classList.add("active");
+
+      screenTrack.onended = () => stopScreenShare();
+    } catch (e) {
+      console.error("Screen share error:", e);
+    }
+  } else {
+    stopScreenShare();
+  }
+});
+
+function stopScreenShare() {
+  if (!isScreenSharing) return;
+  if (screenStream) {
+    screenStream.getTracks().forEach(t => t.stop());
+    screenStream = null;
+  }
+  if (localVideoStream && peerConnection) {
+    const videoTrack = localVideoStream.getVideoTracks()[0];
+    const sender = peerConnection.getSenders().find(s => s.track && s.track.kind === "video");
+    if (sender && videoTrack) sender.replaceTrack(videoTrack);
+    localVideo.srcObject = localVideoStream;
+  }
+  isScreenSharing = false;
+  toggleScreenBtn.classList.remove("active");
+}
+
+endCallBtn.addEventListener("click", () => {
+  if (currentCallPeer) {
+    socket.emit("end_call", { to: currentCallPeer.id, room: myRoom });
+  }
+  cleanupVideoCall();
+});
+
+function cleanupVideoCall() {
+  if (callTimerInterval) { clearInterval(callTimerInterval); callTimerInterval = null; }
+  if (screenStream) { screenStream.getTracks().forEach(t => t.stop()); screenStream = null; }
+  if (localVideoStream) { localVideoStream.getTracks().forEach(t => t.stop()); localVideoStream = null; }
+  if (peerConnection) {
+    peerConnection.ontrack = null;
+    peerConnection.onicecandidate = null;
+    peerConnection.close();
+    peerConnection = null;
+  }
+
+  remoteVideo.srcObject = null;
+  localVideo.srcObject = null;
+  currentCallPeer = null;
+  pendingCall = null;
+  isMicMuted = false;
+  isCamOff = false;
+  isScreenSharing = false;
+
+  toggleMicBtn.classList.remove("off");
+  toggleMicBtn.querySelector(".icon-mic-on").style.display = "block";
+  toggleMicBtn.querySelector(".icon-mic-off").style.display = "none";
+
+  toggleCamBtn.classList.remove("off");
+  toggleCamBtn.querySelector(".icon-cam-on").style.display = "block";
+  toggleCamBtn.querySelector(".icon-cam-off").style.display = "none";
+  toggleScreenBtn.classList.remove("active");
+
+  incomingCallModal.style.display = "none";
+  videoCallModal.style.display = "none";
 }
 
 // ── Timestamp helper ──

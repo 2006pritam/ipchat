@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>IPChat — Room-Based Messenger</title>
+    <title>IPChat — Room-Based Messenger & Video</title>
     <link rel="stylesheet" href="style.css" />
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Syne:wght@400;600;800&display=swap" rel="stylesheet" />
   </head>
@@ -82,6 +82,13 @@
             <span class="header-label">ROOM //</span>
             <span id="header-ip">—</span>
           </div>
+          <button id="video-call-btn" class="header-video-btn" title="Start video call">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+              <polygon points="23 7 16 12 23 17 23 7"/>
+              <rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
+            </svg>
+            <span>Video Call</span>
+          </button>
           <button id="clear-btn" class="clear-btn" title="Clear chat for everyone">🗑 Clear</button>
           <div class="header-user" id="header-username">—</div>
         </header>
@@ -154,6 +161,113 @@
           </button>
         </div>
       </main>
+    </div>
+
+    <!-- INCOMING VIDEO CALL MODAL -->
+    <div id="incoming-call-modal" class="call-modal-backdrop" style="display:none;">
+      <div class="incoming-call-card">
+        <div class="incoming-avatar-ring">
+          <div class="incoming-avatar-pulse"></div>
+          <div class="incoming-avatar-icon">📹</div>
+        </div>
+        <h3 class="incoming-title">INCOMING VIDEO CALL</h3>
+        <p class="incoming-caller"><span id="incoming-caller-name">Someone</span> is calling you...</p>
+        <div class="incoming-actions">
+          <button id="reject-call-btn" class="call-btn-reject" title="Decline call">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <line x1="18" y1="6" x2="6" y2="18"/>
+              <line x1="6" y1="6" x2="18" y2="18"/>
+            </svg>
+            <span>Decline</span>
+          </button>
+          <button id="accept-call-btn" class="call-btn-accept" title="Accept call">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <polygon points="23 7 16 12 23 17 23 7"/>
+              <rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
+            </svg>
+            <span>Accept</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ACTIVE VIDEO CALL SCREEN OVERLAY -->
+    <div id="video-call-modal" class="video-overlay" style="display:none;">
+      <div class="video-call-container">
+        <!-- Call Header Bar -->
+        <div class="video-top-bar">
+          <div class="call-meta-info">
+            <span class="call-dot-live"></span>
+            <span id="call-peer-name" class="call-peer-name">Connected</span>
+            <span id="call-duration" class="call-duration">00:00</span>
+          </div>
+          <span id="call-status-badge" class="call-status-badge">Connecting...</span>
+        </div>
+
+        <!-- Video Viewport Area -->
+        <div class="video-viewport">
+          <!-- Remote Video View (Main) -->
+          <div class="remote-video-wrap">
+            <video id="remote-video" autoplay playsinline></video>
+            <div id="remote-avatar-placeholder" class="video-placeholder" style="display:none;">
+              <div class="placeholder-avatar">👤</div>
+              <span id="placeholder-peer-name">User</span>
+              <span class="placeholder-status">Camera is turned off</span>
+            </div>
+          </div>
+
+          <!-- Local Video View (Picture in Picture) -->
+          <div class="local-video-wrap" id="local-video-wrap">
+            <video id="local-video" autoplay playsinline muted></video>
+            <div class="local-label">You</div>
+          </div>
+        </div>
+
+        <!-- Floating Call Controls Dock -->
+        <div class="video-controls-dock">
+          <!-- Mic Toggle -->
+          <button id="toggle-mic-btn" class="dock-btn" title="Mute / Unmute Mic" aria-label="Toggle Microphone">
+            <svg class="icon-mic-on" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+              <line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/>
+            </svg>
+            <svg class="icon-mic-off" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" style="display:none;">
+              <line x1="1" y1="1" x2="23" y2="23"/>
+              <path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/>
+              <path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"/>
+              <line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/>
+            </svg>
+          </button>
+
+          <!-- Camera Toggle -->
+          <button id="toggle-cam-btn" class="dock-btn" title="Turn Camera On / Off" aria-label="Toggle Camera">
+            <svg class="icon-cam-on" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+              <path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
+            </svg>
+            <svg class="icon-cam-off" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" style="display:none;">
+              <line x1="1" y1="1" x2="23" y2="23"/>
+              <path d="M21 21l-3.56-2.55A2 2 0 0 1 16 17V7a2 2 0 0 1 2-2l5 3.57v9.86z"/>
+              <path d="M1 5a2 2 0 0 1 2-2h11.17l-2 2H3v10.17l-2 2V5z"/>
+            </svg>
+          </button>
+
+          <!-- Screen Share Toggle -->
+          <button id="toggle-screen-btn" class="dock-btn" title="Share Screen" aria-label="Share Screen">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+              <rect x="2" y="3" width="20" height="14" rx="2" ry="2"/>
+              <line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>
+            </svg>
+          </button>
+
+          <!-- End Call Button -->
+          <button id="end-call-btn" class="dock-btn btn-end-call" title="End call" aria-label="End Call">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M12 9c-1.6 0-3.15.25-4.6.72v3.1c0 .39-.23.74-.56.9-.98.49-1.87 1.12-2.66 1.85-.18.18-.43.28-.7.28-.28 0-.53-.11-.71-.29L.29 13.08a.996.996 0 0 1 0-1.41C3.34 8.78 7.46 7 12 7s8.66 1.78 11.71 4.67c.39.39.39 1.02 0 1.41l-2.48 2.48c-.18.18-.43.29-.71.29-.27 0-.52-.11-.7-.28-.79-.74-1.69-1.36-2.67-1.85-.33-.16-.56-.5-.56-.9v-3.1C15.15 9.25 13.6 9 12 9z"/>
+            </svg>
+          </button>
+        </div>
+      </div>
     </div>
 
     <!-- Fullscreen Image Viewer Modal -->
