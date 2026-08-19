@@ -12,7 +12,7 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: "*" },
-  maxHttpBufferSize: 5 * 1024 * 1024, // allow encrypted image payloads
+  maxHttpBufferSize: 15 * 1024 * 1024, // allow encrypted image and voice note payloads (up to 15MB)
 });
 
 const PORT = process.env.PORT || 3000;
@@ -70,6 +70,17 @@ io.on("connection", (socket) => {
     io.to(room).emit("receive_image", {
       username: socket.data.username || "anon",
       imageData,
+      senderId: socket.id,
+      reply: reply || null,
+    });
+  });
+
+  socket.on("send_voice", ({ audioData, duration, room, reply }) => {
+    if (!audioData || !room) return;
+    io.to(room).emit("receive_voice", {
+      username: socket.data.username || "anon",
+      audioData,
+      duration: duration || 0,
       senderId: socket.id,
       reply: reply || null,
     });
