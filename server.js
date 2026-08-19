@@ -2,7 +2,7 @@
 // Room-based real-time messenger. Users "join" a room by entering a
 // shared IP address (used purely as a room code). Messages are E2E
 // encrypted on the client — the server only relays opaque ciphertext.
-// Includes WebRTC signaling for peer-to-peer encrypted Video Calls.
+// Includes WebRTC signaling for peer-to-peer encrypted Voice & Video Calls.
 
 const express = require("express");
 const http = require("http");
@@ -102,13 +102,14 @@ io.on("connection", (socket) => {
     io.to(room).emit("chat_cleared", { clearedBy: socket.data.username || "someone" });
   });
 
-  // ── WebRTC Video Call Signaling ──
-  socket.on("call_user", ({ to, offer }) => {
+  // ── WebRTC Call Signaling (Voice & Video) ──
+  socket.on("call_user", ({ to, offer, callType }) => {
     if (!to || !offer) return;
     io.to(to).emit("incoming_call", {
       from: socket.id,
       username: socket.data.username || "anon",
       offer,
+      callType: callType || "video",
     });
   });
 
