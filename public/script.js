@@ -88,6 +88,27 @@ async function wakeServer() {
 joinBtn.disabled = true;
 wakeServer();
 
+// ── Chunked Uint8Array <-> Base64 conversion (avoids call stack overflow and freeze) ──
+function uint8ToBase64(uint8) {
+  let binary = "";
+  const len = uint8.byteLength;
+  const CHUNK_SIZE = 0x8000; // 32KB chunks
+  for (let i = 0; i < len; i += CHUNK_SIZE) {
+    binary += String.fromCharCode.apply(null, uint8.subarray(i, Math.min(i + CHUNK_SIZE, len)));
+  }
+  return btoa(binary);
+}
+
+function base64ToUint8(b64) {
+  const binary = atob(b64);
+  const len = binary.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
 // ── E2E ENCRYPTION ──
 async function deriveKeyFromIP(ip) {
   const encoder = new TextEncoder();
@@ -101,23 +122,37 @@ async function deriveKeyFromIP(ip) {
 }
 
 async function encryptText(plainText) {
+  if (!cryptoKey) throw new Error("Encryption key is not initialized");
   const encoder = new TextEncoder();
   const iv = window.crypto.getRandomValues(new Uint8Array(12));
   const encrypted = await window.crypto.subtle.encrypt({ name: "AES-GCM", iv }, cryptoKey, encoder.encode(plainText));
-  const combined = new Uint8Array(iv.byteLength + encrypted.byteLength);
+  const combined = new Uint8Array(12 + encrypted.byteLength);
   combined.set(iv, 0);
-  combined.set(new Uint8Array(encrypted), iv.byteLength);
-  return btoa(String.fromCharCode(...combined));
+  combined.set(new Uint8Array(encrypted), 12);
+  return uint8ToBase64(combined);
 }
 
 async function decryptText(base64) {
+  if (!cryptoKey) return "🔒 Key not available";
   try {
-    const combined = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
-    const iv = combined.slice(0, 12);
-    const ciphertext = combined.slice(12);
+    const combined = base64ToUint8(base64);
+    const iv = combined.subarray(0, 12);
+    const ciphertext = combined.subarray(12);
     const decrypted = await window.crypto.subtle.decrypt({ name: "AES-GCM", iv }, cryptoKey, ciphertext);
     return new TextDecoder().decode(decrypted);
-  } catch { return "🔒 Unable to decrypt message"; }
+  } catch (e) {
+    return "🔒 Unable to decrypt message";
+  }
+}
+
+// ── Helper: Blob to Data URL ──
+function blobToDataURL(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
 }
 
 // ── Format audio seconds helper ──
@@ -251,14 +286,14 @@ async function handleImageUpload(file) {
     alert("Please select a valid image file.");
     return;
   }
-  if (file.size > 8 * 1024 * 1024) {
-    alert("Image is too large! Please choose an image under 8MB.");
+  if (file.size > 20 * 1024 * 1024) {
+    alert("Image is too large! Please choose an image under 20MB.");
     return;
   }
 
   const indicator = document.createElement("div");
   indicator.className = "uploading-indicator";
-  indicator.textContent = "Encrypting & uploading photo...";
+  indicator.textContent = "Encrypting & sending photo...";
   messagesArea.appendChild(indicator);
   scrollToBottom();
 
@@ -280,44 +315,54 @@ async function handleImageUpload(file) {
     socket.emit("send_image", payload);
     cancelReply();
   } catch (err) {
-    console.error("Image upload failed:", err);
-    alert("Failed to process image.");
+    console.error("Image upload error:", err);
+    alert("Failed to process image: " + err.message);
   } finally {
     indicator.remove();
   }
 }
 
-// Compress large images client-side before encrypting
+// Fast client-side image compression and scaling
 function readFileOrCompress(file) {
   return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = reject;
-    reader.onload = (e) => {
-      const img = new Image();
-      img.onerror = () => resolve(e.target.result);
-      img.onload = () => {
-        const MAX_DIM = 1600;
-        let { width, height } = img;
-        if (width <= MAX_DIM && height <= MAX_DIM && file.size < 1.5 * 1024 * 1024) {
-          return resolve(e.target.result);
-        }
-        if (width > height && width > MAX_DIM) {
+    if (file.type === "image/svg+xml" || (file.type === "image/gif" && file.size < 1024 * 1024)) {
+      const reader = new FileReader();
+      reader.onload = (e) => resolve(e.target.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+      return;
+    }
+
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      const reader = new FileReader();
+      reader.onload = (e) => resolve(e.target.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    };
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const MAX_DIM = 1280;
+      let { width, height } = img;
+      if (width > MAX_DIM || height > MAX_DIM) {
+        if (width > height) {
           height = Math.round((height * MAX_DIM) / width);
           width = MAX_DIM;
-        } else if (height > MAX_DIM) {
+        } else {
           width = Math.round((width * MAX_DIM) / height);
           height = MAX_DIM;
         }
-        const canvas = document.createElement("canvas");
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext("2d");
-        ctx.drawImage(img, 0, 0, width, height);
-        resolve(canvas.toDataURL("image/jpeg", 0.85));
-      };
-      img.src = e.target.result;
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(img, 0, 0, width, height);
+      resolve(canvas.toDataURL("image/jpeg", 0.82));
     };
-    reader.readAsDataURL(file);
+    img.src = url;
   });
 }
 
@@ -424,7 +469,7 @@ async function startVoiceRecording() {
     recordingTimer.textContent = formatAudioTime(elapsed);
   }, 1000);
 
-  mediaRecorder.start(250);
+  mediaRecorder.start(200);
 }
 
 function stopVoiceRecording(shouldSend) {
@@ -464,30 +509,27 @@ function stopVoiceRecording(shouldSend) {
     scrollToBottom();
 
     try {
-      const reader = new FileReader();
-      reader.onload = async (e) => {
-        const audioDataUrl = e.target.result;
-        const encryptedAudio = await encryptText(audioDataUrl);
+      const audioDataUrl = await blobToDataURL(recordedBlob);
+      const encryptedAudio = await encryptText(audioDataUrl);
 
-        const payload = {
-          audioData: encryptedAudio,
-          duration: durationSec,
-          room: myRoom,
-          reply: replyingTo ? {
-            username: replyingTo.username,
-            message: await encryptText(replyingTo.isVoice ? "[Voice Note]" : replyingTo.isImage ? "[Photo]" : replyingTo.message),
-            isImage: replyingTo.isImage || false,
-            isVoice: replyingTo.isVoice || false
-          } : null
-        };
-
-        socket.emit("send_voice", payload);
-        cancelReply();
-        indicator.remove();
+      const payload = {
+        audioData: encryptedAudio,
+        duration: durationSec,
+        room: myRoom,
+        reply: replyingTo ? {
+          username: replyingTo.username,
+          message: await encryptText(replyingTo.isVoice ? "[Voice Note]" : replyingTo.isImage ? "[Photo]" : replyingTo.message),
+          isImage: replyingTo.isImage || false,
+          isVoice: replyingTo.isVoice || false
+        } : null
       };
-      reader.readAsDataURL(recordedBlob);
+
+      socket.emit("send_voice", payload);
+      cancelReply();
     } catch (err) {
-      console.error("Voice note processing error:", err);
+      console.error("Voice note error:", err);
+      alert("Failed to encrypt and send voice note: " + err.message);
+    } finally {
       indicator.remove();
     }
   };
@@ -498,6 +540,12 @@ function stopVoiceRecording(shouldSend) {
     }
   } catch (e) {
     console.error("Error stopping recorder:", e);
+    if (audioStream) {
+      audioStream.getTracks().forEach(t => t.stop());
+      audioStream = null;
+    }
+    recordingBar.classList.remove("active");
+    chatInputBar.style.display = "flex";
   }
 }
 
@@ -701,7 +749,7 @@ function appendVoiceNote({ username, audioData, duration, timestamp, isSelf, rep
       if (currentlyPlayingAudio && currentlyPlayingAudio !== audio) {
         currentlyPlayingAudio.pause();
       }
-      audio.play();
+      audio.play().catch(err => console.error("Audio playback error:", err));
       currentlyPlayingAudio = audio;
       playIcon.style.display = "none";
       pauseIcon.style.display = "block";
