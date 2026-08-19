@@ -29,8 +29,11 @@ const rtcConfig = {
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
     { urls: "stun:stun2.l.google.com:19302" },
-    { urls: "stun:stun.services.mozilla.com" }
-  ]
+    { urls: "stun:stun3.l.google.com:19302" },
+    { urls: "stun:stun4.l.google.com:19302" },
+    { urls: "stun:global.stun.twilio.com:3478" }
+  ],
+  iceCandidatePoolSize: 10
 };
 let peerConnection = null;
 let localVideoStream = null;
@@ -43,6 +46,99 @@ let isMicMuted = false;
 let isCamOff = false;
 let isScreenSharing = false;
 let iceCandidatesQueue = [];
+
+// ── Web Audio Ringtone & Sound Synthesizer ──
+let audioCtx = null;
+let ringtoneInterval = null;
+
+function getAudioContext() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  if (audioCtx.state === "suspended") {
+    audioCtx.resume();
+  }
+  return audioCtx;
+}
+
+function playIncomingRingtone() {
+  stopRingtone();
+  try {
+    const ctx = getAudioContext();
+    function beep() {
+      if (!incomingCallModal || incomingCallModal.style.display === "none") {
+        stopRingtone();
+        return;
+      }
+      const osc1 = ctx.createOscillator();
+      const osc2 = ctx.createOscillator();
+      const gain = ctx.createGain();
+
+      osc1.type = "sine";
+      osc2.type = "sine";
+      osc1.frequency.setValueAtTime(440, ctx.currentTime);
+      osc2.frequency.setValueAtTime(480, ctx.currentTime);
+
+      gain.gain.setValueAtTime(0, ctx.currentTime);
+      gain.gain.linearRampToValueAtTime(0.18, ctx.currentTime + 0.05);
+      gain.gain.setValueAtTime(0.18, ctx.currentTime + 0.5);
+      gain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.55);
+
+      osc1.connect(gain);
+      osc2.connect(gain);
+      gain.connect(ctx.destination);
+
+      osc1.start(ctx.currentTime);
+      osc2.start(ctx.currentTime);
+      osc1.stop(ctx.currentTime + 0.6);
+      osc2.stop(ctx.currentTime + 0.6);
+    }
+    beep();
+    ringtoneInterval = setInterval(beep, 2200);
+  } catch (e) {
+    console.warn("Incoming ringtone error:", e);
+  }
+}
+
+function playOutgoingDialtone() {
+  stopRingtone();
+  try {
+    const ctx = getAudioContext();
+    function beep() {
+      if (!currentCallPeer || (callStatusBadge && callStatusBadge.textContent !== "Calling...")) {
+        stopRingtone();
+        return;
+      }
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(440, ctx.currentTime);
+
+      gain.gain.setValueAtTime(0, ctx.currentTime);
+      gain.gain.linearRampToValueAtTime(0.1, ctx.currentTime + 0.05);
+      gain.gain.setValueAtTime(0.1, ctx.currentTime + 0.8);
+      gain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.85);
+
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+
+      osc.start(ctx.currentTime);
+      osc.stop(ctx.currentTime + 0.9);
+    }
+    beep();
+    ringtoneInterval = setInterval(beep, 3000);
+  } catch (e) {
+    console.warn("Dialtone audio error:", e);
+  }
+}
+
+function stopRingtone() {
+  if (ringtoneInterval) {
+    clearInterval(ringtoneInterval);
+    ringtoneInterval = null;
+  }
+}
 
 // ── DOM references ──
 const joinScreen          = document.getElementById("join-screen");
@@ -379,7 +475,6 @@ async function handleImageUpload(file) {
   }
 }
 
-// Fast client-side image compression and scaling
 function readFileOrCompress(file) {
   return new Promise((resolve, reject) => {
     if (file.type === "image/svg+xml" || (file.type === "image/gif" && file.size < 1024 * 1024)) {
@@ -517,7 +612,6 @@ async function startVoiceRecording() {
   recordingStartTime = Date.now();
   recordingTimer.textContent = "0:00";
 
-  // Switch UI to recording mode
   chatInputBar.style.display = "none";
   recordingBar.classList.add("active");
 
@@ -537,13 +631,11 @@ function stopVoiceRecording(shouldSend) {
   const durationSec = Math.max(1, Math.round((Date.now() - recordingStartTime) / 1000));
 
   mediaRecorder.onstop = async () => {
-    // Release microphone tracks
     if (audioStream) {
       audioStream.getTracks().forEach(t => t.stop());
       audioStream = null;
     }
 
-    // Reset UI
     recordingBar.classList.remove("active");
     chatInputBar.style.display = "flex";
 
@@ -613,7 +705,6 @@ videoCallBtn.addEventListener("click", () => {
     alert("No one else is currently in this room to call. Share this IP address with a friend!");
     return;
   }
-  // Call the other member in 1-on-1, or prompt if multiple
   const target = otherMembers[0];
   startCallWithPeer(target.id, target.username);
 });
@@ -631,23 +722,32 @@ async function startCallWithPeer(targetId, targetUsername) {
   callDurationEl.textContent = "00:00";
   videoCallModal.style.display = "flex";
 
+  playOutgoingDialtone();
+
   try {
-    localVideoStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    localVideoStream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
     localVideo.srcObject = localVideoStream;
+    localVideo.muted = true;
+    localVideo.play().catch(e => console.warn(e));
   } catch (err) {
-    console.error("Camera/Mic error:", err);
+    console.warn("Could not get audio+video, trying audio only:", err);
     try {
       localVideoStream = await navigator.mediaDevices.getUserMedia({ audio: true });
       localVideo.srcObject = null;
     } catch (e2) {
-      alert("Could not access camera or microphone.");
+      alert("Could not access camera or microphone. Please allow permissions in browser.");
       cleanupVideoCall();
       return;
     }
   }
 
   createPeerConnection();
-  localVideoStream.getTracks().forEach(track => peerConnection.addTrack(track, localVideoStream));
+  localVideoStream.getTracks().forEach(track => {
+    peerConnection.addTrack(track, localVideoStream);
+  });
 
   try {
     const offer = await peerConnection.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
@@ -661,14 +761,29 @@ async function startCallWithPeer(targetId, targetUsername) {
 
 function createPeerConnection() {
   peerConnection = new RTCPeerConnection(rtcConfig);
-  iceCandidatesQueue = [];
 
   peerConnection.ontrack = (event) => {
-    if (event.streams && event.streams[0]) {
-      remoteVideo.srcObject = event.streams[0];
-      remotePlaceholder.style.display = "none";
-      remoteVideo.style.display = "block";
+    console.log("📡 Remote track received:", event.track.kind);
+    let inboundStream = remoteVideo.srcObject;
+    if (!inboundStream || !(inboundStream instanceof MediaStream)) {
+      inboundStream = new MediaStream();
+      remoteVideo.srcObject = inboundStream;
     }
+    if (event.streams && event.streams[0]) {
+      event.streams[0].getTracks().forEach(t => {
+        if (!inboundStream.getTracks().find(existing => existing.id === t.id)) {
+          inboundStream.addTrack(t);
+        }
+      });
+    } else {
+      if (!inboundStream.getTracks().find(existing => existing.id === event.track.id)) {
+        inboundStream.addTrack(event.track);
+      }
+    }
+    remotePlaceholder.style.display = "none";
+    remoteVideo.style.display = "block";
+    remoteVideo.muted = false;
+    remoteVideo.play().catch(e => console.warn("Remote video play warning:", e));
   };
 
   peerConnection.onicecandidate = (event) => {
@@ -680,7 +795,9 @@ function createPeerConnection() {
   peerConnection.onconnectionstatechange = () => {
     if (!peerConnection) return;
     const state = peerConnection.connectionState;
+    console.log("WebRTC Connection State:", state);
     if (state === "connected") {
+      stopRingtone();
       callStatusBadge.textContent = "Connected";
       startCallTimer();
     } else if (state === "disconnected" || state === "failed" || state === "closed") {
@@ -707,11 +824,13 @@ socket.on("incoming_call", ({ from, username, offer }) => {
   pendingCall = { from, username, offer };
   incomingCallerName.textContent = username;
   incomingCallModal.style.display = "flex";
+  playIncomingRingtone();
 });
 
 acceptCallBtn.addEventListener("click", async () => {
   if (!pendingCall) return;
   const { from, username, offer } = pendingCall;
+  stopRingtone();
   incomingCallModal.style.display = "none";
 
   currentCallPeer = { id: from, username };
@@ -722,9 +841,15 @@ acceptCallBtn.addEventListener("click", async () => {
   videoCallModal.style.display = "flex";
 
   try {
-    localVideoStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    localVideoStream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
     localVideo.srcObject = localVideoStream;
+    localVideo.muted = true;
+    localVideo.play().catch(e => console.warn(e));
   } catch (err) {
+    console.warn("Could not get camera, trying audio only:", err);
     try {
       localVideoStream = await navigator.mediaDevices.getUserMedia({ audio: true });
       localVideo.srcObject = null;
@@ -737,13 +862,19 @@ acceptCallBtn.addEventListener("click", async () => {
   }
 
   createPeerConnection();
-  localVideoStream.getTracks().forEach(track => peerConnection.addTrack(track, localVideoStream));
+  localVideoStream.getTracks().forEach(track => {
+    peerConnection.addTrack(track, localVideoStream);
+  });
 
   try {
     await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
     while (iceCandidatesQueue.length > 0) {
       const cand = iceCandidatesQueue.shift();
-      await peerConnection.addIceCandidate(new RTCIceCandidate(cand));
+      try {
+        await peerConnection.addIceCandidate(new RTCIceCandidate(cand));
+      } catch (err) {
+        console.warn("Failed to add queued candidate:", err);
+      }
     }
     const answer = await peerConnection.createAnswer();
     await peerConnection.setLocalDescription(answer);
@@ -756,6 +887,7 @@ acceptCallBtn.addEventListener("click", async () => {
 });
 
 rejectCallBtn.addEventListener("click", () => {
+  stopRingtone();
   if (pendingCall) {
     socket.emit("reject_call", { to: pendingCall.from });
     pendingCall = null;
@@ -764,6 +896,7 @@ rejectCallBtn.addEventListener("click", () => {
 });
 
 socket.on("call_answered", async ({ answer }) => {
+  stopRingtone();
   if (peerConnection) {
     try {
       await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
@@ -771,7 +904,11 @@ socket.on("call_answered", async ({ answer }) => {
       startCallTimer();
       while (iceCandidatesQueue.length > 0) {
         const cand = iceCandidatesQueue.shift();
-        await peerConnection.addIceCandidate(new RTCIceCandidate(cand));
+        try {
+          await peerConnection.addIceCandidate(new RTCIceCandidate(cand));
+        } catch (err) {
+          console.warn("Failed to add queued candidate:", err);
+        }
       }
     } catch (e) {
       console.error("Error setting remote description on answered:", e);
@@ -780,7 +917,7 @@ socket.on("call_answered", async ({ answer }) => {
 });
 
 socket.on("ice_candidate", async ({ candidate }) => {
-  if (peerConnection && peerConnection.remoteDescription) {
+  if (peerConnection && peerConnection.remoteDescription && peerConnection.remoteDescription.type) {
     try {
       await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
     } catch (e) {
@@ -792,11 +929,13 @@ socket.on("ice_candidate", async ({ candidate }) => {
 });
 
 socket.on("call_rejected", ({ username }) => {
+  stopRingtone();
   alert(`${username || "User"} declined the video call.`);
   cleanupVideoCall();
 });
 
 socket.on("call_ended", () => {
+  stopRingtone();
   if (peerConnection || videoCallModal.style.display === "flex") {
     appendSystemMessage("Video call ended");
     cleanupVideoCall();
@@ -807,7 +946,7 @@ socket.on("call_ended", () => {
 toggleMicBtn.addEventListener("click", () => {
   if (!localVideoStream) return;
   isMicMuted = !isMicMuted;
-  localVideoStream.getAudioTracks().forEach(track => track.enabled = !isMicMuted);
+  localVideoStream.getAudioTracks().forEach(track => { track.enabled = !isMicMuted; });
   toggleMicBtn.classList.toggle("off", isMicMuted);
   toggleMicBtn.querySelector(".icon-mic-on").style.display = isMicMuted ? "none" : "block";
   toggleMicBtn.querySelector(".icon-mic-off").style.display = isMicMuted ? "block" : "none";
@@ -816,7 +955,7 @@ toggleMicBtn.addEventListener("click", () => {
 toggleCamBtn.addEventListener("click", () => {
   if (!localVideoStream) return;
   isCamOff = !isCamOff;
-  localVideoStream.getVideoTracks().forEach(track => track.enabled = !isCamOff);
+  localVideoStream.getVideoTracks().forEach(track => { track.enabled = !isCamOff; });
   toggleCamBtn.classList.toggle("off", isCamOff);
   toggleCamBtn.querySelector(".icon-cam-on").style.display = isCamOff ? "none" : "block";
   toggleCamBtn.querySelector(".icon-cam-off").style.display = isCamOff ? "block" : "none";
@@ -826,11 +965,21 @@ toggleScreenBtn.addEventListener("click", async () => {
   if (!peerConnection) return;
   if (!isScreenSharing) {
     try {
-      screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+      screenStream = await navigator.mediaDevices.getDisplayMedia({
+        video: { cursor: "always" },
+        audio: false
+      });
       const screenTrack = screenStream.getVideoTracks()[0];
-      const sender = peerConnection.getSenders().find(s => s.track && s.track.kind === "video");
-      if (sender) sender.replaceTrack(screenTrack);
+      const senders = peerConnection.getSenders();
+      const videoSender = senders.find(s => s.track && s.track.kind === "video") || senders.find(s => s.track === null);
+      if (videoSender) {
+        await videoSender.replaceTrack(screenTrack);
+      } else {
+        peerConnection.addTrack(screenTrack, screenStream);
+      }
       localVideo.srcObject = screenStream;
+      localVideo.muted = true;
+      localVideo.play().catch(e => console.warn(e));
       isScreenSharing = true;
       toggleScreenBtn.classList.add("active");
 
@@ -843,7 +992,7 @@ toggleScreenBtn.addEventListener("click", async () => {
   }
 });
 
-function stopScreenShare() {
+async function stopScreenShare() {
   if (!isScreenSharing) return;
   if (screenStream) {
     screenStream.getTracks().forEach(t => t.stop());
@@ -851,15 +1000,21 @@ function stopScreenShare() {
   }
   if (localVideoStream && peerConnection) {
     const videoTrack = localVideoStream.getVideoTracks()[0];
-    const sender = peerConnection.getSenders().find(s => s.track && s.track.kind === "video");
-    if (sender && videoTrack) sender.replaceTrack(videoTrack);
+    const senders = peerConnection.getSenders();
+    const videoSender = senders.find(s => s.track && s.track.kind === "video") || senders.find(s => s.track === null);
+    if (videoSender && videoTrack) {
+      await videoSender.replaceTrack(videoTrack);
+    }
     localVideo.srcObject = localVideoStream;
+    localVideo.muted = true;
+    localVideo.play().catch(e => console.warn(e));
   }
   isScreenSharing = false;
   toggleScreenBtn.classList.remove("active");
 }
 
 endCallBtn.addEventListener("click", () => {
+  stopRingtone();
   if (currentCallPeer) {
     socket.emit("end_call", { to: currentCallPeer.id, room: myRoom });
   }
@@ -867,6 +1022,7 @@ endCallBtn.addEventListener("click", () => {
 });
 
 function cleanupVideoCall() {
+  stopRingtone();
   if (callTimerInterval) { clearInterval(callTimerInterval); callTimerInterval = null; }
   if (screenStream) { screenStream.getTracks().forEach(t => t.stop()); screenStream = null; }
   if (localVideoStream) { localVideoStream.getTracks().forEach(t => t.stop()); localVideoStream = null; }
@@ -884,6 +1040,7 @@ function cleanupVideoCall() {
   isMicMuted = false;
   isCamOff = false;
   isScreenSharing = false;
+  iceCandidatesQueue = [];
 
   toggleMicBtn.classList.remove("off");
   toggleMicBtn.querySelector(".icon-mic-on").style.display = "block";
