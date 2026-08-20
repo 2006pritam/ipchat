@@ -2,7 +2,7 @@
 // Room-based real-time messenger. Users "join" a room by entering a
 // shared IP address (used purely as a room code). Messages are E2E
 // encrypted on the client — the server only relays opaque ciphertext.
-// Includes WebRTC signaling for peer-to-peer encrypted Voice & Video Calls.
+// Includes Multi-Peer Mesh WebRTC for Unlimited Group Calls & Video Collage.
 
 const express = require("express");
 const http = require("http");
@@ -22,9 +22,12 @@ const PORT = process.env.PORT || 3000;
 app.use(express.static(path.join(__dirname, "public")));
 app.get("/ping", (_req, res) => res.status(200).send("pong"));
 
-// ── In-memory room membership ──
+// ── In-memory room membership & active calls ──
 // rooms: Map<roomName, Map<socketId, username>>
 const rooms = new Map();
+
+// activeCalls: Map<roomName, { callType, startedBy, participants: Map<socketId, username> }>
+const activeCalls = new Map();
 
 function getMembers(room) {
   const map = rooms.get(room);
@@ -34,6 +37,40 @@ function getMembers(room) {
 
 function broadcastMembers(room) {
   io.to(room).emit("members_update", { members: getMembers(room) });
+}
+
+function broadcastCallState(room) {
+  const call = activeCalls.get(room);
+  if (call && call.participants.size > 0) {
+    const list = [...call.participants.entries()].map(([id, username]) => ({ id, username }));
+    io.to(room).emit("room_call_state", {
+      active: true,
+      callType: call.callType,
+      startedBy: call.startedBy,
+      count: call.participants.size,
+      participants: list
+    });
+  } else {
+    activeCalls.delete(room);
+    io.to(room).emit("room_call_state", {
+      active: false,
+      callType: null,
+      startedBy: null,
+      count: 0,
+      participants: []
+    });
+  }
+}
+
+function ensureRoomCall(room, callType, starterName) {
+  if (!activeCalls.has(room)) {
+    activeCalls.set(room, {
+      callType: callType || "voice",
+      startedBy: starterName || "A friend",
+      participants: new Map()
+    });
+  }
+  return activeCalls.get(room);
 }
 
 io.on("connection", (socket) => {
@@ -53,6 +90,7 @@ io.on("connection", (socket) => {
 
     socket.to(room).emit("user_joined", { message: `${username} joined the room` });
     broadcastMembers(room);
+    broadcastCallState(room);
     console.log(`➡️  ${username} joined ${room}`);
   });
 
@@ -102,58 +140,129 @@ io.on("connection", (socket) => {
     io.to(room).emit("chat_cleared", { clearedBy: socket.data.username || "someone" });
   });
 
-  // ── WebRTC Call Signaling (Voice & Video) ──
-  socket.on("call_user", ({ to, offer, callType }) => {
+  // ── Multi-Peer Mesh Call Signaling ──
+  socket.on("start_group_call", ({ room, callType }) => {
+    if (!room) return;
+    const type = callType || "voice";
+    const isNew = !activeCalls.has(room) || activeCalls.get(room).participants.size === 0;
+    const call = ensureRoomCall(room, type, socket.data.username);
+    call.callType = type;
+
+    // Get all existing participants BEFORE adding this socket
+    const existingParticipants = [...call.participants.entries()]
+      .filter(([id]) => id !== socket.id)
+      .map(([id, username]) => ({ id, username }));
+
+    call.participants.set(socket.id, socket.data.username || "anon");
+
+    // Only ring everyone else if this is a newly initiated call
+    if (isNew) {
+      socket.to(room).emit("incoming_room_call", {
+        startedBy: socket.data.username || "A friend",
+        callType: type,
+      });
+    }
+
+    // Send existing peers so new caller creates peer connections with everyone already in call
+    socket.emit("group_call_joined", {
+      callType: call.callType,
+      existingPeers: existingParticipants
+    });
+
+    socket.to(room).emit("peer_joined_group_call", {
+      socketId: socket.id,
+      username: socket.data.username || "anon",
+      callType: call.callType
+    });
+
+    broadcastCallState(room);
+    console.log(`📞 ${socket.data.username} started ${type} meet in room ${room}`);
+  });
+
+  socket.on("join_group_call", ({ room }) => {
+    if (!room) return;
+    const call = ensureRoomCall(room, "voice", socket.data.username);
+
+    // Get all existing participants BEFORE adding this socket
+    const existingParticipants = [...call.participants.entries()]
+      .filter(([id]) => id !== socket.id)
+      .map(([id, username]) => ({ id, username }));
+
+    call.participants.set(socket.id, socket.data.username || "anon");
+
+    socket.emit("group_call_joined", {
+      callType: call.callType,
+      existingPeers: existingParticipants
+    });
+
+    socket.to(room).emit("peer_joined_group_call", {
+      socketId: socket.id,
+      username: socket.data.username || "anon",
+      callType: call.callType
+    });
+
+    broadcastCallState(room);
+    console.log(`👤 ${socket.data.username} joined meet in ${room} (Total active: ${call.participants.size})`);
+  });
+
+  socket.on("signal_offer", ({ to, offer, callType }) => {
     if (!to || !offer) return;
-    io.to(to).emit("incoming_call", {
+    io.to(to).emit("signal_offer", {
       from: socket.id,
       username: socket.data.username || "anon",
       offer,
-      callType: callType || "video",
+      callType
     });
   });
 
-  socket.on("answer_call", ({ to, answer }) => {
+  socket.on("signal_answer", ({ to, answer }) => {
     if (!to || !answer) return;
-    io.to(to).emit("call_answered", {
+    io.to(to).emit("signal_answer", {
       from: socket.id,
       answer,
     });
   });
 
-  socket.on("ice_candidate", ({ to, candidate }) => {
+  socket.on("signal_ice_candidate", ({ to, candidate }) => {
     if (!to || !candidate) return;
-    io.to(to).emit("ice_candidate", {
+    io.to(to).emit("signal_ice_candidate", {
       from: socket.id,
       candidate,
     });
   });
 
-  socket.on("reject_call", ({ to }) => {
-    if (!to) return;
-    io.to(to).emit("call_rejected", {
-      from: socket.id,
-      username: socket.data.username || "anon",
-    });
-  });
-
-  socket.on("end_call", ({ to, room }) => {
-    if (to) {
-      io.to(to).emit("call_ended", { from: socket.id });
-    } else if (room) {
-      socket.to(room).emit("call_ended", { from: socket.id });
+  socket.on("leave_group_call", ({ room }) => {
+    if (room && activeCalls.has(room)) {
+      const call = activeCalls.get(room);
+      call.participants.delete(socket.id);
+      socket.to(room).emit("peer_left_group_call", {
+        socketId: socket.id,
+        username: socket.data.username || "anon"
+      });
+      broadcastCallState(room);
+      console.log(`👋 ${socket.data.username} left meet in ${room}`);
     }
   });
 
   socket.on("disconnect", () => {
     const { room, username } = socket.data;
-    if (room && rooms.has(room)) {
-      rooms.get(room).delete(socket.id);
-      if (rooms.get(room).size === 0) rooms.delete(room);
-      socket.to(room).emit("user_left", { message: `${username} left the room` });
-      socket.to(room).emit("user_stopped_typing", { username });
-      socket.to(room).emit("call_ended", { from: socket.id });
-      broadcastMembers(room);
+    if (room) {
+      if (rooms.has(room)) {
+        rooms.get(room).delete(socket.id);
+        if (rooms.get(room).size === 0) rooms.delete(room);
+        socket.to(room).emit("user_left", { message: `${username} left the room` });
+        socket.to(room).emit("user_stopped_typing", { username });
+        broadcastMembers(room);
+      }
+      if (activeCalls.has(room)) {
+        const call = activeCalls.get(room);
+        call.participants.delete(socket.id);
+        socket.to(room).emit("peer_left_group_call", {
+          socketId: socket.id,
+          username: username || "anon"
+        });
+        broadcastCallState(room);
+      }
     }
     console.log(`⚠️  disconnected: ${socket.id}`);
   });
