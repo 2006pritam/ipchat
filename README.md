@@ -1,6 +1,8 @@
 # IPChat — Room-Based Group Messenger, Voice & Video Collage
 
-A minimal, encrypted real-time chat, group voice calling, and multi-user video meet web application where you join a room simply by entering a **shared IP address** as the room code. Anyone who types the same IP lands in the same room. A recreation and enhancement .
+A minimal, encrypted real-time chat, group voice calling, and multi-user video meet web application where you join a room simply by entering a **shared IP address** as the room code. Anyone who types the same IP lands in the same room. A recreation and enhancement of [ipchat.in](https://ipchat.in/).
+
+---
 
 ## ✨ Features
 
